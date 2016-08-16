@@ -1,0 +1,747 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Copyright (c) 2016, Joyent, Inc.
+ */
+
+/*
+ * configure CONFIG_FILE: given the configuration file specified in this
+ * project's README.md, produce a bash-sourceable file that will set PATH and
+ * other environment variables for use with this test suite.  Also set up local
+ * directories to find the appropriate implementations of the Moray client and
+ * server.
+ *
+ * The documentation for the environment variables lives in the generated file.
+ */
+
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_envfile = require('../lib/envfile');
+var mod_forkexec = require('forkexec');
+var mod_fs = require('fs');
+var mod_jsprim = require('jsprim');
+var mod_mkdirp = require('mkdirp');
+var mod_path = require('path');
+var mod_vasync = require('vasync');
+var VError = require('verror');
+
+/* Node 0.12 defines fs.X_OK, but that's not in 0.10. */
+var WORLD_EXECUTABLE = 0x1;
+
+/*
+ * This is the "npm install" argument we use to get the "stock" Moray client.
+ * TODO This should likely eventually become "moray" (i.e., the latest published
+ * one), but we haven't published v2 yet, so we're using this.
+ */
+var DFL_MORAY_CLIENT_TARGET = 'git://github.com/joyent/node-moray.git';
+var DFL_MORAY_SERVER_TARGET = 'git://github.com/joyent/moray.git';
+
+var usageMessage = [
+    '',
+    'Sets up this test suite workspace to run the test suite as configured ',
+    'in the specified CONFIG_FILE.  With -n, prints out the commands that ',
+    'would be executed without actually executing them.  See the README file',
+    'for information about the format of CONFIG_FILE.'
+].join('\n');
+
+/*
+ * Parse command-line arguments, read and parse the configuration file, and then
+ * hand off to configure() to do the real work.
+ */
+function main()
+{
+    var filename, argv;
+    var dryRun = false;
+
+    mod_cmdutil.configure({
+        'synopses': [ '[-n] CONFIG_FILE' ],
+        'usageMessage': usageMessage
+    });
+
+    argv = process.argv.slice(2);
+    if (argv.length > 0 && (argv[0] == '-n' || argv[0] == '--dry-run')) {
+        dryRun = true;
+        argv.shift();
+    }
+
+    if (argv.length != 1) {
+        mod_cmdutil.usage();
+    }
+
+    filename = argv[0];
+    readJsonFile(filename, function (err, p) {
+        var verr;
+
+        if (err) {
+            mod_cmdutil.fail(err);
+        }
+
+        verr = validateTestSuiteConfig(p);
+        if (verr instanceof Error) {
+            mod_cmdutil.fail(new VError(verr, 'validate "%s"', filename));
+        }
+
+        configure({
+            'tsconfig': p,
+            'dryRun': dryRun
+        }, function (perr) {
+            if (perr) {
+                mod_cmdutil.fail(perr);
+            }
+        });
+    });
+}
+
+/*
+ * Validates the given (parsed) configuration file.  Returns an error if the
+ * file is not valid.
+ */
+function validateTestSuiteConfig(tsconfig)
+{
+    var error;
+
+    error = mod_jsprim.validateJsonObject(tsConfigSchema, tsconfig);
+    if (error instanceof Error) {
+        return (error);
+    }
+
+    if (!tsconfig.server.hasOwnProperty('configBase') &&
+        !tsconfig.server.hasOwnProperty('remote')) {
+        return (new VError('at least one of "server.configBase" or ' +
+            '"server.remote" must be specified'));
+    }
+
+    return (null);
+}
+
+/*
+ * This function drives the work of this command.  Named arguments:
+ *
+ *     tsconfig     parsed, validated test suite configuration file
+ *
+ *     dryRun       boolean indicating whether this is a dry run.
+ *                  See the usage message for information about what this means.
+ */
+function configure(args, callback)
+{
+    var cfgctx, tsconfig, p, funcs;
+
+    mod_assertplus.object(args, 'args');
+    mod_assertplus.object(args.tsconfig, 'args.tsconfig');
+
+    /*
+     * Figure out what we're going to do up front so that we can report it for a
+     * dry run without doing anything.
+     */
+    tsconfig = args.tsconfig;
+    cfgctx = {
+        /*
+         * User-specified configuration
+         */
+
+        /* whether this is a dry run */
+        'c_dryrun': args.dryRun === true,
+
+        /* raw test suite configuration (parsed and validated) */
+        'c_tsconfig': tsconfig,
+
+        /* whether to use an existing Moray server */
+        'c_remote': mod_jsprim.pluck(tsconfig, 'server.remote'),
+        'c_use_remote': null,
+
+        /* user-configured "node" for server execution */
+        'c_server_node': mod_jsprim.pluck(
+            tsconfig, 'server.node') !== undefined ?
+            mod_path.resolve(mod_jsprim.pluck(tsconfig, 'server.node')) :
+            'node',
+
+        /* user-configured client path (null means stock client) */
+        'c_client_target': null,
+        /* user-configured server path (null means stock server) */
+        'c_server_target': null,
+
+        /*
+         * Derived configuration
+         */
+
+        /* root of test suite workspace */
+        'c_test_root': mod_path.normalize(mod_path.join(__dirname, '..')),
+        /* directory where we install packages and other files */
+        'c_run_root': null,
+
+        /* root of directory where client package is installed */
+        'c_run_client': null,
+        /* path to npm to use for the client */
+        'c_npm_client': null,
+        /* actual client package directory */
+        'c_client_installed': null,
+
+        /* root of directory where server package is installed */
+        'c_run_server': null,
+        /* path to npm to use for the server */
+        'c_npm_server': null,
+        /* actual server package directory */
+        'c_server_installed': null,
+        /* contents of server base configuration */
+        'c_server_base_config': null,
+        /* generated server configuration file */
+        'c_server_config': null,
+
+        /* environment variables to configure */
+        'c_env': new mod_envfile.Environment(),
+        'c_env_path': null          /* path to generated env.sh */
+    };
+
+    cfgctx.c_use_remote = cfgctx.c_remote !== undefined;
+
+    /*
+     * Fill in default values for the client and server npm targets.
+     */
+    p = mod_jsprim.pluck(cfgctx.c_tsconfig, 'client.path');
+    if (p !== undefined) {
+        cfgctx.c_client_target = mod_path.resolve(cfgctx.c_test_root, p);
+    }
+
+    p = mod_jsprim.pluck(cfgctx.c_tsconfig, 'server.path');
+    if (p !== undefined) {
+        cfgctx.c_server_target = mod_path.resolve(cfgctx.c_test_root, p);
+    }
+
+    /*
+     * Configure the other derived paths.
+     *
+     * We install or link the client and server dependencies in separate trees
+     * under "./run" and then use NODE_PATH to cause node to find them there.
+     * This allows the tests to require 'moray' as any other client consumer
+     * would without requiring us to put it into our package.json.  Part of the
+     * point of this test suite repository is to allow users to point the test
+     * suite at their own client implementation, and it would be confusing and
+     * potentially brittle to manage it via package.json.  Besides that, if we
+     * just depended on "moray" in package.json, "npm install" could wind up
+     * installing different packages based on our top-level dependencies than
+     * would be installed by a fresh copy of the same moray-client package.
+     * Keeping it in a separate path causes npm to treat it separately.
+     *
+     * The server has to be in a separate tree anyway because it may run with a
+     * different Node version with a different set of dependencies.
+     */
+    cfgctx.c_run_root = mod_path.join(cfgctx.c_test_root, 'run');
+    cfgctx.c_env_path = mod_path.join(cfgctx.c_run_root, 'env.sh');
+
+    cfgctx.c_run_client = mod_path.join(cfgctx.c_run_root, 'client');
+    cfgctx.c_client_installed = mod_path.join(cfgctx.c_run_client,
+        'node_modules', 'moray');
+
+    cfgctx.c_run_server = mod_path.join(cfgctx.c_run_root, 'server');
+    cfgctx.c_server_installed = mod_path.join(cfgctx.c_run_server,
+        'node_modules', 'moray-server');
+    cfgctx.c_server_config = mod_path.join(cfgctx.c_run_server,
+        'config-generated.json');
+
+    /*
+     * Configure the environment variables we'll need to set.
+     */
+    cfgctx.c_env.setVar({
+        'name': 'PATH',
+        'value': process.env['PATH'],
+        'comment': 'PATH is set so that the requested "node" is first on ' +
+            'our the PATH.'
+    });
+
+    cfgctx.c_node_client = 'node';
+    cfgctx.c_npm_client = 'npm';
+
+    if (cfgctx.c_server_node != 'node') {
+        cfgctx.c_npm_server = mod_path.join(
+            mod_path.dirname(cfgctx.c_server_node), 'npm');
+    } else {
+        cfgctx.c_npm_server = 'npm';
+    }
+
+    cfgctx.c_env.setVar({
+        'name': 'MORAY_TEST_ROOT',
+        'value': cfgctx.c_test_root,
+        'comment': 'MORAY_TEST_ROOT is the root of the test suite directory.'
+    });
+
+    if (process.env['NODE_PATH']) {
+        cfgctx.c_env.setVar({
+            'name': 'NODE_PATH',
+            'value': process.env['NODE_PATH']
+        });
+    }
+
+    cfgctx.c_env.prependPath({
+        'name': 'NODE_PATH',
+        'pathentry': mod_path.normalize(mod_path.join(
+            cfgctx.c_client_installed, '..')),
+        'comment': 'NODE_PATH is set to include the Moray client dependency.'
+    });
+
+    if (cfgctx.c_use_remote) {
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_REMOTE',
+            'value': cfgctx.c_remote,
+            'comment': 'URL for remote Moray instance to use for testing'
+        });
+
+        funcs = [
+            configureSanityCheckClientDirectory,
+            configureMkdirpClient,
+            configureInstallClient,
+            configureWriteEnv
+        ];
+    } else {
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_NODE_PATH',
+            'value': mod_path.normalize(mod_path.join(
+                cfgctx.c_server_installed, '..')),
+            'comment': 'MORAY_TEST_SERVER_NODE_PATH is the NODE_PATH that ' +
+                'will be used when invoking the server.'
+        });
+
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_NODE',
+            'value': cfgctx.c_server_node,
+            'comment': '"node" binary used to invoke the server'
+        });
+
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_ROOT',
+            'value': cfgctx.c_server_installed,
+            'comment': 'root of the server installation directory'
+        });
+
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_CONFIG',
+            'value': cfgctx.c_server_config,
+            'comment': 'path to generated server configuration file'
+        });
+
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_EXTRA_ARGS',
+            'value': '',
+            'comment': 'Extra arguments to pass to the Moray server.'
+        });
+
+        p = mod_jsprim.pluck(cfgctx.c_tsconfig, 'server.start');
+        if (p === undefined) {
+            p = '"$MORAY_TEST_SERVER_NODE" "$MORAY_TEST_SERVER_ROOT/main.js" ' +
+                '-f "$MORAY_TEST_SERVER_CONFIG" -v $MORAY_TEST_EXTRA_ARGS 2>&1';
+        }
+        cfgctx.c_env.setVar({
+            'name': 'MORAY_TEST_SERVER_RUN',
+            'value': p,
+            'comment': 'bash command used to invoke server'
+        });
+
+        funcs = [
+            configureSanityCheckClientDirectory,
+            configureSanityCheckServerDirectory,
+            configureMkdirpClient,
+            configureMkdirpServer,
+            configureReadServerConfig,
+            configureWriteServerConfig,
+            configureInstallClient,
+            configureInstallServer,
+            configureWriteEnv
+        ];
+    }
+
+    mod_vasync.pipeline({
+        'arg': cfgctx,
+        'funcs': funcs
+    }, function (err) {
+        callback(err);
+    });
+}
+
+/*
+ * Validate the presence of a Moray client installation.
+ */
+function configureSanityCheckClientDirectory(cfgctx, callback)
+{
+    configureSanityCheckDirectory(cfgctx, cfgctx.c_client_installed, callback);
+}
+
+/*
+ * Validate the presence of a Moray server installation.
+ */
+function configureSanityCheckServerDirectory(cfgctx, callback)
+{
+    configureSanityCheckDirectory(cfgctx, cfgctx.c_server_installed, callback);
+}
+
+/*
+ * General-purpose function (i.e., not a pipeline function) to validate the
+ * presence of an installed package.  Abort if there's something already there
+ * so that we don't have to worry about clobbering the wrong thing.
+ */
+function configureSanityCheckDirectory(cfgctx, directory, callback)
+{
+    if (cfgctx.c_dryrun) {
+        setImmediate(callback);
+        return;
+    }
+
+    mod_fs.lstat(directory, function (err) {
+        if (!err) {
+            callback(new VError('refusing to clobber "%s" ' +
+                '(run "make clean" to remove)', directory));
+        } else if (err && err['code'] != 'ENOENT') {
+            callback(new VError('lstat "%s"', directory));
+        } else {
+            callback();
+        }
+    });
+}
+
+/*
+ * Create the parent directory tree for the client install location.  We create
+ * the node_modules directory to cause "npm install" to install packages there
+ * instead of inside this package.
+ */
+function configureMkdirpClient(cfgctx, callback)
+{
+    configureMkdirp(cfgctx,
+        mod_path.join(cfgctx.c_run_client, 'node_modules'), callback);
+}
+
+/*
+ * Create the parent directory tree for the server install location.  We create
+ * the node_modules directory to cause "npm install" to install packages there
+ * instead of inside this package.
+ */
+function configureMkdirpServer(cfgctx, callback)
+{
+    configureMkdirp(cfgctx,
+        mod_path.join(cfgctx.c_run_server, 'node_modules'), callback);
+}
+
+/*
+ * General-purpose function (i.e., not a pipeline function) to "mkdirp" the
+ * specified path.  This does nothing in dry-run mode.
+ */
+function configureMkdirp(cfgctx, path, callback)
+{
+    if (cfgctx.c_dryrun) {
+        console.log('mkdir -p %s', JSON.stringify(path));
+        setImmediate(callback);
+        return;
+    }
+
+    mod_mkdirp(path, callback);
+}
+
+/*
+ * Read the server base configuration file specified by the user.
+ */
+function configureReadServerConfig(cfgctx, callback)
+{
+    var p;
+
+    /* The path was validated earlier. */
+    p = mod_jsprim.pluck(cfgctx.c_tsconfig, 'server.configBase');
+    mod_assertplus.string(p, 'server.configBase');
+
+    readJsonFile(p, function (err, c) {
+        if (err) {
+            callback(err);
+        } else {
+            cfgctx.c_server_base_config = c;
+            callback();
+        }
+    });
+}
+
+/*
+ * Write out a server configuration file based on the provided base
+ * configuration.
+ */
+function configureWriteServerConfig(cfgctx, callback)
+{
+    /*
+     * We currently don't make any changes from the provided base configuration.
+     * In the future, we may want to change the port number.
+     */
+    mod_assertplus.string(cfgctx.c_server_config);
+    mod_assertplus.object(cfgctx.c_server_base_config);
+    configureWriteFile(cfgctx, {
+        'filename': cfgctx.c_server_config,
+        'contents': JSON.stringify(cfgctx.c_server_base_config, null, '\t')
+    }, callback);
+}
+
+/*
+ * General-purpose function (i.e., not a pipeline function ) to write out the
+ * given contents to the specified file.  In dry-run mode, this emits a bash
+ * snippet that would do the same thing.
+ */
+function configureWriteFile(cfgctx, args, callback)
+{
+    var filename, eom, stream;
+
+    mod_assertplus.object(cfgctx, 'cfgctx');
+    mod_assertplus.object(args, 'args');
+    mod_assertplus.string(args.contents, 'args.contents');
+    mod_assertplus.string(args.filename, 'args.filename');
+    mod_assertplus.func(callback, 'callback');
+
+    filename = args.filename;
+    eom = 'EOF';
+    if (args.contents.indexOf(eom) != -1) {
+        setImmediate(callback, new VError('internal error: unsupported ' +
+            'file contents (contains "%s")', eom));
+        return;
+    }
+
+    if (cfgctx.c_dryrun) {
+        stream = process.stdout;
+        stream.write('cat > ' + JSON.stringify(filename) + ' << \'' +
+            eom + '\'\n');
+        stream.write(args.contents);
+        stream.write('\n' + eom + '\n');
+        setImmediate(callback);
+    } else {
+        console.log('writing %s', args.filename);
+        mod_fs.writeFile(args.filename, args.contents, function (err) {
+            if (err) {
+                err = new VError(err, 'write "%s"', filename);
+            }
+
+            callback(err);
+        });
+    }
+}
+
+/*
+ * Install the requested client package.
+ */
+function configureInstallClient(cfgctx, callback)
+{
+    configureInstall(cfgctx, {
+        'root': cfgctx.c_run_client,
+        'npm': cfgctx.c_npm_client,
+        'pkgname': 'moray',
+        'target': cfgctx.c_client_target,
+        'dflvalue': DFL_MORAY_CLIENT_TARGET
+    }, callback);
+}
+
+/*
+ * Install the requested server package.
+ */
+function configureInstallServer(cfgctx, callback)
+{
+    configureInstall(cfgctx, {
+        'root': cfgctx.c_run_server,
+        'npm': cfgctx.c_npm_server,
+        'pkgname': 'moray-server',
+        'target': cfgctx.c_server_target,
+        'dflvalue': DFL_MORAY_SERVER_TARGET
+    }, callback);
+}
+
+/*
+ * General-purpose function (i.e., not a pipeline function) to install the
+ * requested npm package.  Named arguments:
+ *
+ *     root     working directory into which to install the package
+ *
+ *     npm      path to the "npm" to use for the installation
+ *
+ *     pkgname  name of the package to install.  This is only used as a
+ *              sanity-check against the name in the package.json file.
+ *
+ *     target   If non-null, this is a path on the local filesystem containing a
+ *              package to "npm link" into place.  If null, a default copy of
+ *              the package is installed.
+ *
+ *     dflvalue The default argument to "npm install" if "target" was null.
+ *
+ * The reason "target" and "dflvalue" aren't combined into a single argument
+ * that just specifies what to install is that if "target" is null, we'll use
+ * "npm link".  Otherwise, we'll use "npm install".
+ */
+function configureInstall(cfgctx, args, callback)
+{
+    var forkexecArgs, pkgjson;
+    var pkgname, target, dflvalue;
+
+    mod_assertplus.object(cfgctx, 'cfgctx');
+    mod_assertplus.object(args, 'args');
+    mod_assertplus.string(args.root, 'args.root');
+    mod_assertplus.string(args.npm, 'args.npm');
+    mod_assertplus.string(args.pkgname, 'args.pkgname');
+    mod_assertplus.optionalString(args.target, 'args.target');
+    mod_assertplus.string(args.dflvalue, 'args.dflvalue');
+    mod_assertplus.func(callback, 'callback');
+
+    pkgname = args.pkgname;
+    target = args.target;
+    dflvalue = args.dflvalue;
+    forkexecArgs = {
+        'cwd': args.root,
+        'includeStderr': true,
+        'maxBuffer': 1024 * 1024
+    };
+
+    /*
+     * If the user provided us a string, we assume that's a local path and we
+     * use "npm link" to create a symlink for it into node_modules.  If not, we
+     * assume they want to use the stock target, and we'll "npm install" that.
+     */
+    if (target === null) {
+        forkexecArgs.argv = [ args.npm, 'install', dflvalue ];
+        configureExec(cfgctx, forkexecArgs, callback);
+        return;
+    }
+
+    /*
+     * In the local case, check the package name first.  We only bother with
+     * this because it's very possible people will be using a "moray" server
+     * whose package name is still "moray" instead of "moray-server", and that
+     * would lead to surprising, hard-to-debug behavior.
+     */
+    pkgjson = mod_path.join(target, 'package.json');
+    mod_fs.readFile(pkgjson, function (err, contents) {
+        var pkginfo;
+
+        if (err) {
+            callback(new VError(err, 'read "%s"', pkgjson));
+            return;
+        }
+
+        try {
+            pkginfo = JSON.parse(contents);
+        } catch (ex) {
+            callback(new VError(ex, 'parse "%s"', pkgjson));
+            return;
+        }
+
+        if (pkginfo['name'] != pkgname) {
+            callback(new VError('expected package name "%s" in "%s"',
+                pkgname, pkgjson));
+            return;
+        }
+
+        forkexecArgs.argv = [ args.npm, 'link', target ];
+        configureExec(cfgctx, forkexecArgs, callback);
+    });
+}
+
+/*
+ * General-purpose function (i.e., not a pipeline function) for executing a
+ * shell command as part of a configure() operation.  This essentially checks
+ * cfgctx.c_dryrun and may execute the command using forkexec, or may skip it.
+ */
+function configureExec(cfgctx, args, callback)
+{
+    if (cfgctx.c_dryrun) {
+        console.log('(cd "%s" && %s)', args.cwd, args.argv.join(' '));
+        setImmediate(callback);
+    } else {
+        console.error('running: %s (in %s)', args.argv.join(' '), args.cwd);
+        mod_forkexec.forkExecWait(args, callback);
+    }
+}
+
+/*
+ * Write out the environment variable that users can source to run individual
+ * tests.  In dry-run mode, this prints out a bash snippet that would do the
+ * exact same thing.
+ */
+function configureWriteEnv(cfgctx, callback)
+{
+    var stream, contents;
+
+    mod_assertplus.string(cfgctx.c_env_path, 'cfgctx.c_env_path');
+    contents = [
+        '#',
+        '# This file was auto-generated by the "configure" tool in the ',
+        '# moray-test-suite repository.',
+        '#',
+        '',
+        ''
+    ].join('\n');
+    stream = cfgctx.c_env.readable();
+    stream.on('data', function (c) { contents += c.toString('utf8'); });
+    stream.on('end', function () {
+        configureWriteFile(cfgctx, {
+            'filename': cfgctx.c_env_path,
+            'contents': contents
+        }, callback);
+    });
+}
+
+/*
+ * This function should probably be provided elsewhere.
+ */
+function readJsonFile(filename, callback)
+{
+    mod_fs.readFile(filename, function (err, contents) {
+        var c;
+
+        if (err) {
+            callback(new VError(err, 'read "%s"', filename));
+            return;
+        }
+
+        try {
+            c = JSON.parse(contents);
+        } catch (ex) {
+            callback(new VError(err, 'parse "%s"', filename));
+            return;
+        }
+
+        callback(null, c);
+    });
+}
+
+
+/*
+ * Configuration validation schemas.
+ */
+
+var tsSchemaStringNonEmpty = {
+    'type': 'string',
+    'minLength': 1
+};
+
+var tsSchemaPathname = tsSchemaStringNonEmpty;
+
+var tsConfigSchema = {
+    'type': 'object',
+    'additionalProperties': false,
+    'properties': {
+        'client': {
+            'type': 'object',
+            'additionalProperties': false,
+            'properties': {
+                'path': tsSchemaPathname
+            }
+        },
+
+        'server': {
+            'type': 'object',
+            'additionalProperties': false,
+            'required': true,
+            'properties': {
+                'configBase': tsSchemaPathname,
+                'path': tsSchemaPathname,
+                'start': tsSchemaStringNonEmpty,
+                'node': tsSchemaPathname,
+                'remote': tsSchemaStringNonEmpty
+            }
+        }
+    }
+};
+
+main();

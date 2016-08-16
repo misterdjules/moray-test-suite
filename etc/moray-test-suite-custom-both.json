@@ -1,0 +1,10 @@
+{
+    "client": {
+        "path": "../node-moray"
+    },
+    "server": {
+        "node": "../node-versions/node-v0.10.43-sunos-x86/bin/node",
+    	"path": "../moray",
+        "configBase": "../moray/config.json"
+    }
+}

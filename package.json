@@ -1,0 +1,27 @@
+{
+	"name": "moray-test-suite",
+	"description": "Test suite for Moray client and server",
+	"version": "1.0.0",
+	"private": "true",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git://github.com/joyent/moray-test-suite.git"
+	},
+	"dependencies": {
+		"assert-plus": "1.0.0",
+		"bunyan": "^1.8.1",
+		"cmdutil": "^1.0.0",
+		"faucet": "0.0.1",
+		"forkexec": "^1.1.0",
+		"kang": "1.0.1",
+		"libuuid": "0.2.1",
+		"jsprim": "^1.3.0",
+		"mkdirp": "0.5.1",
+		"once": "^1.3.3",
+		"tape": "^2.14.0",
+		"vasync": "^1.6.4",
+		"verror": "^1.7.0",
+		"wordwrap": "^1.0.0"
+	}
+}

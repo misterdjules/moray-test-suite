@@ -1,0 +1,5 @@
+{
+    "server": {
+        "configBase": "../moray/config.json"
+    }
+}
