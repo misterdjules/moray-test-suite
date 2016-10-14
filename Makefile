@@ -60,13 +60,16 @@ CLEAN_FILES += node_modules
 test: | $(FAUCET) $(MORAY_TEST_ENV_FILE)
 	(set -o pipefail; \
 	source $(MORAY_TEST_ENV_FILE) && \
+	$(CTRUN) node test/cli-sanity.test.js | $(FAUCET) && \
 	$(CTRUN) node test/client.test.js | $(FAUCET) && \
+	$(CTRUN) node test/close-handles.test.js | $(FAUCET) && \
 	$(CTRUN) node test/buckets.test.js | $(FAUCET) && \
 	$(CTRUN) node test/objects.test.js | $(FAUCET) && \
 	$(CTRUN) node test/sql.test.js | $(FAUCET) && \
 	$(CTRUN) node test/integ.test.js | $(FAUCET) && \
 	$(CTRUN) node test/arrays.test.js | $(FAUCET) && \
 	$(CTRUN) node test/version.test.js | $(FAUCET) && \
+	$(CTRUN) node test/translate-legacy.test.js | $(FAUCET) && \
 	$(CTRUN) node test/loop.test.js | bunyan -lfatal )
 	@echo tests passed
 

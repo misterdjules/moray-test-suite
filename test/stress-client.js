@@ -549,6 +549,9 @@ scCommands.push({
                  * different than the failure cases above because it's simpler
                  * to create a working sequence in this order.  deleteBucket
                  * appears twice to deal with unclean exits.
+                 *
+                 * This sequence is replicated in cli-sanity.test.js for
+                 * command-line tools.  Updates here should be propagated there.
                  */
 
                 function cmdRpcOkayDeleteBucketCleanup(_, subcallback) {
