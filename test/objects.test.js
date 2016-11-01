@@ -8,6 +8,7 @@
  * Copyright (c) 2016, Joyent, Inc.
  */
 
+var assert = require('assert-plus');
 var jsprim = require('jsprim');
 var tape = require('tape');
 var once = require('once');
@@ -141,6 +142,68 @@ function assertObject(t, obj, k, v) {
         t.ok(obj.value.vnode);
     }
     return (undefined);
+}
+
+function reindexBucket(client, bucketName, callback) {
+    assert.object(client, 'client');
+    assert.string(bucketName, 'bucketName');
+    assert.func(callback, 'callback');
+
+    var PAGESIZE = 100;
+
+    function runReindex() {
+        client.reindexObjects(bucketName, PAGESIZE, function (err, res) {
+            if (err) {
+                callback(err);
+                return;
+            }
+            if (res.processed === 0) {
+                callback();
+            } else {
+                process.nextTick(runReindex);
+            }
+        });
+    }
+
+    runReindex();
+}
+
+function testSearchFilters(t, client, bucketName, tests, findOptions, cb) {
+    assert.object(t, 't');
+    assert.object(client, 'client');
+    assert.string(bucketName, 'bucketName');
+    assert.object(tests, 'tests');
+    assert.object(tests.filters, 'tests.filters');
+    assert.string(tests.results_key, 'tests.results_key');
+    assert.object(findOptions, 'findOptions');
+    assert.func(cb, 'cb');
+
+    vasync.forEachParallel({
+        inputs: Object.keys(tests.filters),
+        func: function filterCheck(f, done) {
+            var found = false;
+            done = once(done);
+            var filter = '(&(str=required)' + f + ')';
+            var res = c.findObjects(b, filter, findOptions);
+            res.once('error', function (err) {
+                t.ifError(err);
+                done(err);
+            });
+            res.on('record', function (obj) {
+                if (tests.results_key !== obj.key)
+                    t.fail('invalid key');
+                found = true;
+            });
+            res.once('end', function () {
+                if (tests.filters[f]) {
+                    t.ok(found, f + ' should find object');
+                } else {
+                    t.notOk(found, f + ' should not find object');
+                }
+                done();
+            });
+        }
+    }, cb);
 }
 
 ///--- Tests
@@ -2126,6 +2189,277 @@ test('filter on unindexed fields', function (t) {
             t.ifError(err);
             t.end();
         });
+    });
+});
+
+/*
+ * Test searching for objects with filters that use fields that are being
+ * reindexed. The values for the fields that are being reindexed are added
+ * _before_ the index is added, so they should be stored in the _value column of
+ * the database, not in any of its indexes.
+ */
+test('filter on reindexing fields with values not yet reindexed', function (t) {
+    var v = {
+        str: 'required',
+        reindexing_str: 'value',
+        reindexing_num: 15,
+        reindexing_zero: 0,
+        reindexing_boolean: true,
+        reindexing_null: null
+    };
+
+    var k = uuid.v4();
+    var tests = {
+        results_key: k,
+        filters: {
+            // Equality:
+            '(reindexing_str=value)': true,
+            '(reindexing_str=bad)': false,
+            '(reindexing_num=15)': true,
+            '(reindexing_num=14)': false,
+            '(reindexing_num=0)': false,
+            '(reindexing_zero=0)': true,
+            '(reindexing_zero=1)': false,
+            '(reindexing_boolean=true)': true,
+            '(reindexing_boolean=false)': false,
+            // Presence:
+            '(reindexing_str=*)': true,
+            '(reindexing_num=*)': true,
+            '(reindexing_zero=*)': true,
+            '(reindexing_null=*)': false,
+            '(reindexing_bogus=*)': false,
+            '(reindexing_boolean=*)': true,
+            // GE/LE:
+            '(reindexing_num>=15)': true,
+            '(reindexing_num>=0)': true,
+            '(reindexing_num>=16)': false,
+            '(reindexing_num<=15)': true,
+            '(reindexing_num<=0)': false,
+            '(reindexing_num<=16)': true,
+            '(reindexing_str>=value)': true,
+            '(reindexing_str>=valud)': true,
+            '(reindexing_str>=valuf)': false,
+            '(reindexing_str<=value)': true,
+            '(reindexing_str<=valud)': false,
+            '(reindexing_str<=valuf)': true,
+            // Substring:
+            '(reindexing_str=val*)': true,
+            '(reindexing_str=val*e)': true,
+            '(reindexing_str=*alue)': true,
+            '(reindexing_str=v*l*e)': true,
+            '(reindexing_str=n*ope)': false,
+            '(reindexing_str=*nope)': false,
+            '(reindexing_str=nope*)': false,
+            '(reindexing_str=no*p*e)': false,
+            // Ext:
+            '(reindexing_str:caseIgnoreMatch:=VALUE)': true,
+            '(reindexing_str:caseIgnoreMatch:=NOPE)': false,
+            '(reindexing_str:caseIgnoreSubstringsMatch:=V*LUE)': true,
+            '(reindexing_str:caseIgnoreSubstringsMatch:=N*PE)': false
+        }
+    };
+
+    var config = jsprim.deepCopy(BUCKET_CFG);
+
+    vasync.pipeline({funcs: [
+        /*
+         * Make sure to add the object _before_ the indexes are created.
+         */
+        function addObjectWithReindexingValues(arg, next) {
+            c.putObject(b, k, v, function (putErr) {
+                if (putErr) {
+                    t.ifError(putErr);
+                }
+
+                next(putErr);
+            });
+        },
+        /*
+         * Now create the various indexes and bump the bucket version.
+         */
+        function updateBucketToNewVersion(arg, next) {
+            config.index['reindexing_str'] =  {type: 'string'};
+            config.index['reindexing_num'] =  {type: 'number'};
+            config.index['reindexing_zero'] =  {type: 'number'};
+            config.index['reindexing_boolean'] =  {type: 'boolean'};
+            config.index['reindexing_null'] =  {type: 'number'};
+            config.options.version++;
+            c.updateBucket(b, config, function (err) {
+                t.ifError(err);
+                t.ok(true, 'update bucket');
+                next(err);
+            });
+        },
+        /*
+         * Perform searches _before_ reindexing is started so that we can make
+         * sure that we can find objects by looking at values in the _value
+         * column of the database and that filter values are updated correctly
+         * according to the types of the various indexed fields.
+         */
+        function searchWithFiltersOnReindexingFields(arg, next) {
+            testSearchFilters(t, c, b, tests, {
+                requiredBucketVersion: config.options.version
+            }, next);
+        },
+        function reindex(arg, next) {
+            reindexBucket(c, b, next);
+        },
+        /*
+         * Now make sure that we can search objects with the same filters once
+         * the bucket is fully reindexed and that indexed fields are stored in
+         * the database's indexes rather than in its _value column.
+         */
+        function searchWithFiltersOnReindexedFields(arg, next) {
+            var testsClone = jsprim.deepCopy(tests);
+            var filterString;
+
+            /*
+             * There is no point in performing a search on a field whose value
+             * is null once it's indexed, as any field that is indexed will be
+             * represented in Postgres by a value that wouldn't have the same
+             * semantics as the null value in JavaScript. That is, it would be
+             * represented as a value that doesn't mean "no value", and a
+             * presence filter of the form (already_indexed_null=*) would match
+             * that value. So we're removing that filter from the set of tests.
+             */
+            for (filterString in testsClone.filters) {
+                if (filterString.indexOf('reindexing_null') !== -1) {
+                    delete testsClone.filters[filterString];
+                }
+            }
+
+            testSearchFilters(t, c, b, testsClone, {
+                requiredBucketVersion: config.options.version
+            }, next);
+        }
+    ]}, function allDone(err) {
+        t.end();
+    });
+});
+
+/*
+ * Test searching for objects with filters that use fields that are being
+ * reindexed. The values for the fields that are being reindexed are added
+ * _after_ the index is added, so they should be stored in a database index.
+ */
+test('filter on reindexing fields with values already reindexed', function (t) {
+    var v = {
+        str: 'required',
+        already_indexed_str: 'value',
+        already_indexed_num: 15,
+        already_indexed_zero: 0,
+        already_indexed_boolean: true,
+        /*
+         * There is no point in adding a field whose value is null, as any field
+         * that is indexed will be represented in Postgres by a value that
+         * wouldn't have the same semantics as the null value in JavaScript.
+         * That is, it would be represented as a value that doesn't mean "no
+         * value", and a presence filter of the form (already_indexed_null=*)
+         * would match that value.
+         *
+         * already_indexed_null: null
+         */
+    };
+
+    var k = uuid.v4();
+    var tests = {
+        results_key: k,
+        filters: {
+            // Equality:
+            '(already_indexed_str=value)': true,
+            '(already_indexed_str=bad)': false,
+            '(already_indexed_num=15)': true,
+            '(already_indexed_num=14)': false,
+            '(already_indexed_num=0)': false,
+            '(already_indexed_zero=0)': true,
+            '(already_indexed_zero=1)': false,
+            '(already_indexed_boolean=true)': true,
+            '(already_indexed_boolean=false)': false,
+            // Presence:
+            '(already_indexed_str=*)': true,
+            '(already_indexed_num=*)': true,
+            '(already_indexed_zero=*)': true,
+            '(already_indexed_null=*)': false,
+            '(already_indexed_bogus=*)': false,
+            '(already_indexed_boolean=*)': true,
+            // GE/LE:
+            '(already_indexed_num>=15)': true,
+            '(already_indexed_num>=0)': true,
+            '(already_indexed_num>=16)': false,
+            '(already_indexed_num<=15)': true,
+            '(already_indexed_num<=0)': false,
+            '(already_indexed_num<=16)': true,
+            '(already_indexed_str>=value)': true,
+            '(already_indexed_str>=valud)': true,
+            '(already_indexed_str>=valuf)': false,
+            '(already_indexed_str<=value)': true,
+            '(already_indexed_str<=valud)': false,
+            '(already_indexed_str<=valuf)': true,
+            // Substring:
+            '(already_indexed_str=val*)': true,
+            '(already_indexed_str=val*e)': true,
+            '(already_indexed_str=*alue)': true,
+            '(already_indexed_str=v*l*e)': true,
+            '(already_indexed_str=n*ope)': false,
+            '(already_indexed_str=*nope)': false,
+            '(already_indexed_str=nope*)': false,
+            '(already_indexed_str=no*p*e)': false,
+            // Ext:
+            '(already_indexed_str:caseIgnoreMatch:=VALUE)': true,
+            '(already_indexed_str:caseIgnoreMatch:=NOPE)': false,
+            '(already_indexed_str:caseIgnoreSubstringsMatch:=V*LUE)': true,
+            '(already_indexed_str:caseIgnoreSubstringsMatch:=N*PE)': false
+        }
+    };
+
+    var config = jsprim.deepCopy(BUCKET_CFG);
+
+    vasync.pipeline({funcs: [
+        function updateBucketToNewVersion(arg, next) {
+            config.index['already_indexed_str'] =  {type: 'string'};
+            config.index['already_indexed_num'] =  {type: 'number'};
+            config.index['already_indexed_zero'] =  {type: 'number'};
+            config.index['already_indexed_boolean'] =  {type: 'boolean'};
+            config.options.version++;
+            c.updateBucket(b, config, function (err) {
+                t.ifError(err);
+                t.ok(true, 'update bucket');
+                next(err);
+            });
+        },
+        /*
+         * Make sure to add the objects _after_ the index were created, but
+         * _before_ reindexing is complete.
+         */
+        function addObjectWithReindexingValues(arg, next) {
+            c.putObject(b, k, v, function (putErr) {
+                if (putErr) {
+                    t.ifError(putErr);
+                }
+
+                next(putErr);
+            });
+        },
+        function searchWithFiltersOnReindexingFields(arg, next) {
+            testSearchFilters(t, c, b, tests, {
+                requiredBucketVersion: config.options.version
+            }, next);
+        },
+        /*
+         * Now perform reindexing, and then test searching again to make sure
+         * that the search results are the same after reindexing is complete and
+         * no field is considered as being reindexed.
+         */
+        function reindex(arg, next) {
+            reindexBucket(c, b, next);
+        },
+        function searchWithFiltersOnReindexedFields(arg, next) {
+            testSearchFilters(t, c, b, tests, {
+                requiredBucketVersion: config.options.version
+            }, next);
+        }
+    ]}, function allDone(err) {
+        t.end();
     });
 });
 
